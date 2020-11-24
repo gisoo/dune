@@ -225,8 +225,12 @@ namespace Transports
       void
       calculateAndAnnounce(void)
       {
-
-        if (abs(m_salinity_calculated_local.getValueFP()) < m_args.max_acceptable_salinity_difrences)
+        if(!m_salinity_received)
+        {
+          m_salinity_calculated_local.setValueFP(1);
+          m_salinity_calculated_ext.setValueFP(1);
+        }
+        else if (abs(m_salinity_calculated_local.getValueFP()) < m_args.max_acceptable_salinity_difrences)
         {
           m_salinity_calculated_local.setValueFP(m_salinity_received->getValueFP() + 1);
           m_salinity_calculated_ext.setValueFP(m_salinity_calculated_local.getValueFP());
