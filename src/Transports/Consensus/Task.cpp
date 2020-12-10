@@ -67,15 +67,17 @@ namespace Transports
       // // Ignored interfaces.
       std::vector<std::string> ignored_interfaces;
       //Maximum acceptable salinity differences
-      float max_acceptable_salinity_difrences;
+      float max_acceptable_salinity;
+      // Trace incoming messages.
+      bool trace_in;
+      // Represting the measured salinity.
+      uint8_t measured_salinity;
     };
 
     struct Task : public DUNE::Tasks::Task
     {
       // Local advertising buffer.
       uint8_t m_bfr_loc[4096];
-      // External advertising buffer.
-      uint8_t m_bfr_ext[4096];
       // Socket.
       UDPSocket m_sock;
       // List of destinations.
@@ -87,17 +89,21 @@ namespace Transports
       IMC::Salinity *m_salinity_received;
 
       // Last calculated salinity local
-      IMC::Salinity m_salinity_calculated_local;
+      IMC::Salinity m_salinity_estimated_local;
 
-      // Last calculated salinity local
-      IMC::Salinity m_salinity_calculated_ext;
-      // True if all node agreed on level of salinity.
-      bool is_consensus_reached;
+      // Our DUNE's UID URL.
+      std::string m_dune_uid;
+      // Last timestamps.
+      std::map<Address, double> m_tstamps;
+      // Deserialization buffer.
+      uint8_t m_bfr[4096];
+
+      bool is_message_received;
 
       Task(const std::string &name, Tasks::Context &ctx) : DUNE::Tasks::Task(name, ctx)
       {
         // Define configuration parameters.
-        param("Delta", m_args.max_acceptable_salinity_difrences)
+        param("Delta", m_args.max_acceptable_salinity)
             .defaultValue("10")
             .description("Max salinity differences");
 
@@ -114,7 +120,7 @@ namespace Transports
             .description("Enable broadcast announcing");
 
         param("Ports", m_args.ports)
-            .defaultValue("30100, 30101, 30102, 30103, 30104")
+            .defaultValue("31100, 31101, 31102, 31103, 31104")
             .description("List of destination ports");
 
         param("Multicast Address", m_args.addr_mcast)
@@ -124,6 +130,14 @@ namespace Transports
         param("Ignored Interfaces", m_args.ignored_interfaces)
             .defaultValue("eth0:prv")
             .description("List of interfaces whose services will not be announced");
+
+        param("Print Incoming Messages", m_args.trace_in)
+            .defaultValue("false")
+            .description("Print incoming messages (Debug)");
+
+        param("Measured salinity", m_args.measured_salinity)
+            .defaultValue("1")
+            .description("Representing the measured salinity.");
 
         // Register listeners.
         bind<IMC::Salinity>(this);
@@ -139,6 +153,114 @@ namespace Transports
       onResourceInitialization(void)
       {
         setEntityState(IMC::EntityState::ESTA_NORMAL, Status::CODE_ACTIVE);
+
+        // Initialize socket.
+        m_sock.setMulticastTTL(1);
+        m_sock.setMulticastLoop(false);
+        m_sock.enableBroadcast(true);
+
+        std::vector<Interface> itfs = Interface::get();
+        for (unsigned i = 0; i < itfs.size(); ++i)
+          m_sock.joinMulticastGroup(m_args.addr_mcast, itfs[i].address());
+
+        for (unsigned i = 0; i < m_args.ports.size(); ++i)
+        {
+          try
+          {
+            m_sock.bind(m_args.ports[i], Address::Any, false);
+            inf(DTR("listening on %s:%u"), Address(Address::Any).c_str(), m_args.ports[i]);
+            setEntityState(IMC::EntityState::ESTA_NORMAL, Status::CODE_ACTIVE);
+            return;
+          }
+          catch (...)
+          {
+          }
+        }
+
+        throw std::runtime_error(DTR("no available ports to listen to advertisements"));
+      }
+
+      void
+      readMessage(UDPSocket &sock)
+      {
+        inf(DTR("Reading messages started."));
+
+        Address addr;
+        uint16_t rv = sock.read(m_bfr, sizeof(m_bfr), &addr);
+        IMC::Message *msg = IMC::Packet::deserialize(m_bfr, rv);
+
+        // Validate message.
+        if (msg == 0)
+        {
+          war(DTR("discarding spurious message"));
+          delete msg;
+          return;
+        }
+
+        if (msg->getId() != DUNE_IMC_SALINITY)
+        {
+          war(DTR("discarding spurious message '%s'"), msg->getName());
+          delete msg;
+          return;
+        }
+
+        // Check if we already got this message.
+        std::map<Address, double>::iterator itr = m_tstamps.find(addr);
+        if (itr != m_tstamps.end())
+        {
+          if (itr->second == msg->getTimeStamp())
+          {
+
+            delete msg;
+            return;
+          }
+          else
+          {
+
+            itr->second = msg->getTimeStamp();
+          }
+        }
+        else
+        {
+
+          m_tstamps[addr] = msg->getTimeStamp();
+        }
+
+        // Discarding messages that come from same dune resource
+        if (m_salinity_estimated_local.getSource() == msg->getSource())
+        {
+          war(DTR("Discarding the message from the same dune"));
+          delete msg;
+          return;
+        }
+
+        //Remaining message can be casted to salinity.
+        m_salinity_received = static_cast<IMC::Salinity *>(msg);
+
+        // Check if the message was sent from our computer.
+        bool m_local = false;
+        std::vector<Interface> itfs = Interface::get();
+        for (unsigned i = 0; i < itfs.size(); ++i)
+        {
+          if (itfs[i].address() == addr)
+          {
+            m_local = true;
+            break;
+          }
+        }
+
+        // Send to other tasks.
+        dispatch(msg, DF_KEEP_TIME);
+
+        if (m_args.trace_in)
+          msg->toText(std::cerr);
+
+        delete msg;
+
+        inf(DTR("Reading message completed."));
+
+        //Call the stimation method to restimate the salinity using the last received message.
+        stimateSalinity();
       }
 
       void
@@ -153,8 +275,6 @@ namespace Transports
           *m_salinity_received = *msg;
         else
           m_salinity_received = new IMC::Salinity(*msg);
-
-        calculateAndAnnounce();
       }
 
       void
@@ -223,63 +343,88 @@ namespace Transports
       }
 
       void
-      calculateAndAnnounce(void)
+      stimateSalinity(void)
       {
-        if(!m_salinity_received)
+
+        inf(DTR(" Salinity stimation started "));
+
+        //In the first iteration and haven't recieved any salinity yet, the measured salinity will be used
+        if (!m_salinity_received)
         {
-          m_salinity_calculated_local.setValueFP(1);
-          m_salinity_calculated_ext.setValueFP(1);
+          m_salinity_estimated_local.setValueFP(m_args.measured_salinity);
         }
-        else if (abs(m_salinity_calculated_local.getValueFP()) < m_args.max_acceptable_salinity_difrences)
+        else if (abs(m_salinity_estimated_local.getValueFP()) < m_args.max_acceptable_salinity)
         {
-          m_salinity_calculated_local.setValueFP(m_salinity_received->getValueFP() + 1);
-          m_salinity_calculated_ext.setValueFP(m_salinity_calculated_local.getValueFP());
+
+          m_salinity_estimated_local.setValueFP(m_salinity_received->value + m_salinity_estimated_local.getValueFP());
+
+          m_salinity_received->value = 0;
+        }
+        else
+        {
+          m_salinity_estimated_local.setValueFP(m_args.max_acceptable_salinity);
         }
 
-        // We do this everytime because the number and configuration of
-        // network interfaces might have changed.
+        inf(DTR("Salinity stimation is done."));
+
+        //Sending the stimated salinity to other vehicles.
+        announceEstimatedSalinity();
+      }
+
+      void
+      announceEstimatedSalinity(void)
+      {
+
+        inf(DTR("Announcing the estimated salinity started."));
+
         probeInterfaces();
 
-        // Refresh serialized Salinity message.
-        // m_salinity_calculated_local.
-        m_salinity_calculated_local.setTimeStamp();
-        uint16_t bfr_len_loc = IMC::Packet::serialize(&m_salinity_calculated_local, m_bfr_loc, sizeof(m_bfr_loc));
-        m_salinity_calculated_ext.setTimeStamp();
-        uint16_t bfr_len_ext = IMC::Packet::serialize(&m_salinity_calculated_ext, m_bfr_ext, sizeof(m_bfr_ext));
+        // m_salinity_estimated_local.
+        m_salinity_estimated_local.setTimeStamp();
+        uint16_t bfr_len_loc = IMC::Packet::serialize(&m_salinity_estimated_local, m_bfr_loc, sizeof(m_bfr_loc));
 
-        dispatch(m_salinity_calculated_local);
-        dispatch(m_salinity_calculated_ext);
+        dispatch(m_salinity_estimated_local);
 
         for (unsigned i = 0; i < m_dsts.size(); ++i)
         {
           try
           {
-            if (m_dsts[i].local)
+            if (!m_dsts[i].local)
               m_sock.write(m_bfr_loc, bfr_len_loc, m_dsts[i].addr, m_dsts[i].port);
-            else
-              m_sock.write(m_bfr_ext, bfr_len_ext, m_dsts[i].addr, m_dsts[i].port);
+            inf(DTR("Wrting new estimated value  %F on UDP"), m_salinity_estimated_local.getValueFP());
+          }
+          catch (...)
+          {
+          }
+        }
+
+        inf(DTR("Announcing Estimated salinity is done!"));
+      }
+
+     
+      void
+      onMain(void)
+      {
+        inf(DTR("Main method started."));
+        stimateSalinity();
+
+        while (!stopping())
+        {
+          inf(DTR("consensus loop in main method started."));
+
+          Delay::wait(1.0);
+          try
+          {
+            if (IO::Poll::poll(m_sock, 1.0))
+              readMessage(m_sock);
           }
           catch (...)
           {
           }
         }
       }
-
-      void
-      onMain(void)
-      {
-        while (!stopping())
-        {
-
-          if (!m_salinity_calculated_local.getValueFP())
-          {
-            calculateAndAnnounce();
-          }
-          consumeMessages();
-        }
-      }
-    };
-  } // namespace Consensus
+    }; // namespace Consensus
+  }    // namespace Consensus
 } // namespace Transports
 
 DUNE_TASK
